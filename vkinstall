@@ -1,0 +1,216 @@
+#!/bin/sh
+set -eu
+
+PROG="${0##*/}"
+
+DRYRUN=0
+UPDATE_ONLY=0
+KERNEL_SRC=""
+
+BOOT_DIR="/boot"
+SOURCE_LINK="/usr/src/linux"
+SYSTEMD_BOOT_DEFAULT="/etc/default/systemd-boot"
+LOADER_ENTRIES_DIR="$BOOT_DIR/loader/entries"
+
+usage() {
+	cat <<EOF
+usage: $PROG [-d] [-u] [-h] [KERNEL_SRC]
+
+Install or update a manually built Void Linux kernel for systemd-boot.
+
+Options:
+  -d    dry run; print what would be done, but change nothing
+  -u    update /boot files and systemd-boot entry only;
+        do not update /usr/src/linux symlink
+  -h    show this help
+
+Arguments:
+  KERNEL_SRC
+        Kernel source tree to install from.
+        Defaults to the current working directory.
+
+Installed/updated files:
+  /boot/config-<kernelrelease>
+  /boot/vmlinuz-<kernelrelease>
+  /boot/initramfs-<kernelrelease>.img
+  /boot/loader/entries/void-x86_64-<kernelrelease>.conf
+
+Normally also updates:
+  /usr/src/linux -> KERNEL_SRC
+EOF
+}
+
+run() {
+	if [ "$DRYRUN" -eq 1 ]; then
+		printf 'dry-run:'
+		printf ' %s' "$@"
+		printf '\n'
+	else
+		"$@"
+	fi
+}
+
+write_file() {
+	path="$1"
+	tmp="${path}.tmp.$$"
+
+	cat > "$tmp"
+
+	if [ -f "$path" ] && cmp -s "$tmp" "$path"; then
+		echo "unchanged: $path"
+		rm -f "$tmp"
+		return 0
+	fi
+
+	if [ "$DRYRUN" -eq 1 ]; then
+		echo "dry-run: write $path"
+		rm -f "$tmp"
+	else
+		mv "$tmp" "$path"
+		echo "wrote: $path"
+	fi
+}
+
+install_if_changed() {
+	src="$1"
+	dst="$2"
+
+	if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+		echo "unchanged: $dst"
+		return 0
+	fi
+
+	run install -Dm644 "$src" "$dst"
+
+	if [ "$DRYRUN" -eq 0 ]; then
+		echo "installed: $dst"
+	fi
+}
+
+while getopts "duh" opt; do
+	case "$opt" in
+		d) DRYRUN=1 ;;
+		u) UPDATE_ONLY=1 ;;
+		h) usage; exit 0 ;;
+		*) usage >&2; exit 2 ;;
+	esac
+done
+
+shift $((OPTIND - 1))
+
+if [ "$#" -gt 1 ]; then
+	usage >&2
+	exit 2
+fi
+
+KERNEL_SRC="${1:-$(pwd)}"
+
+cd "$KERNEL_SRC"
+
+KERNEL_SRC_ABS="$(pwd -P)"
+KERNEL_NAME="$(make -s kernelrelease)"
+ENTRY_PATH="$LOADER_ENTRIES_DIR/void-x86_64-$KERNEL_NAME.conf"
+INITRAMFS="$BOOT_DIR/initramfs-$KERNEL_NAME.img"
+
+if [ -z "$KERNEL_NAME" ]; then
+	echo "error: could not determine kernel release" >&2
+	exit 1
+fi
+
+if [ ! -f .config ]; then
+	echo "error: missing .config in $KERNEL_SRC_ABS" >&2
+	exit 1
+fi
+
+if [ ! -f arch/x86/boot/bzImage ]; then
+	echo "error: missing arch/x86/boot/bzImage" >&2
+	echo "build the kernel first" >&2
+	exit 1
+fi
+
+if [ ! -d "/usr/lib/modules/$KERNEL_NAME" ]; then
+	echo "error: missing /usr/lib/modules/$KERNEL_NAME" >&2
+	echo "run: make modules_install" >&2
+	exit 1
+fi
+
+if [ ! -d "$BOOT_DIR" ]; then
+	echo "error: missing boot directory: $BOOT_DIR" >&2
+	exit 1
+fi
+
+if [ ! -d "$LOADER_ENTRIES_DIR" ]; then
+	echo "error: missing loader entries directory: $LOADER_ENTRIES_DIR" >&2
+	exit 1
+fi
+
+if [ ! -f "$SYSTEMD_BOOT_DEFAULT" ]; then
+	echo "error: missing $SYSTEMD_BOOT_DEFAULT" >&2
+	exit 1
+fi
+
+CMDLINE="$(
+	sed -n 's/^CMDLINE="\([^"]*\)".*/\1/p' "$SYSTEMD_BOOT_DEFAULT" |
+	tail -n 1
+)"
+
+if [ -z "$CMDLINE" ]; then
+	echo "error: could not read CMDLINE from $SYSTEMD_BOOT_DEFAULT" >&2
+	echo 'expected: CMDLINE="..."' >&2
+	exit 1
+fi
+
+echo "Kernel:  $KERNEL_NAME"
+echo "Source:  $KERNEL_SRC_ABS"
+echo "Boot:    $BOOT_DIR"
+
+if [ "$DRYRUN" -eq 1 ]; then
+	echo "Mode:    dry-run"
+fi
+
+if [ "$UPDATE_ONLY" -eq 1 ]; then
+	echo "Mode:    update-only"
+fi
+
+echo
+
+install_if_changed .config "$BOOT_DIR/config-$KERNEL_NAME"
+install_if_changed arch/x86/boot/bzImage "$BOOT_DIR/vmlinuz-$KERNEL_NAME"
+
+if [ -f "$INITRAMFS" ]; then
+	echo "exists: $INITRAMFS"
+	echo "regenerating initramfs"
+fi
+
+run mkinitcpio -k "$KERNEL_NAME" -g "$INITRAMFS"
+
+if [ "$DRYRUN" -eq 0 ]; then
+	echo "generated: $INITRAMFS"
+fi
+
+if [ "$UPDATE_ONLY" -eq 0 ]; then
+	if [ -L "$SOURCE_LINK" ] && [ "$(readlink "$SOURCE_LINK")" = "$KERNEL_SRC_ABS" ]; then
+		echo "unchanged: $SOURCE_LINK -> $KERNEL_SRC_ABS"
+	else
+		run ln -sfn "$KERNEL_SRC_ABS" "$SOURCE_LINK"
+
+		if [ "$DRYRUN" -eq 0 ]; then
+			echo "linked: $SOURCE_LINK -> $KERNEL_SRC_ABS"
+		fi
+	fi
+else
+	echo "skipped: $SOURCE_LINK symlink update"
+fi
+
+write_file "$ENTRY_PATH" <<EOF
+title        Void Linux x86_64 $KERNEL_NAME
+sort-key     void
+version      $KERNEL_NAME
+options      $CMDLINE
+linux        vmlinuz-$KERNEL_NAME
+initrd       initramfs-$KERNEL_NAME.img
+architecture x64
+EOF
+
+echo
+echo "Done."
