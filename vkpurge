@@ -1,0 +1,213 @@
+#!/bin/sh
+set -eu
+
+PROG="${0##*/}"
+DRYRUN=0
+FORCE=0
+
+BOOT_DIR="/boot"
+ENTRIES_DIR="$BOOT_DIR/loader/entries"
+MODULES_DIR="/usr/lib/modules"
+SRC_DIR="/usr/src"
+
+usage() {
+	cat <<EOF
+Usage:
+  $PROG [-d] list [version ...]
+  $PROG [-d] rm all
+  $PROG [-d] rm <version ...>
+
+Options:
+  -d    dry run; print what would be removed
+  -f    also remove package-owned kernel files
+  -h    show this help
+
+Examples:
+  $PROG list
+  $PROG rm 7.0.3-tkg-bore-llvm
+  $PROG -d rm all
+EOF
+}
+
+run() {
+	if [ "$DRYRUN" -eq 1 ]; then
+		printf 'dry-run:'
+		printf ' %s' "$@"
+		printf '\n'
+	else
+		"$@"
+	fi
+}
+
+is_running_kernel() {
+	[ "$1" = "$(uname -r)" ]
+}
+
+is_xbps_owned_path() {
+	path="$1"
+
+	command -v xbps-query >/dev/null 2>&1 || return 1
+	xbps-query -o "$path" >/dev/null 2>&1
+}
+
+remove_path() {
+	path="$1"
+
+	[ -e "$path" ] || [ -L "$path" ] || return 0
+
+	if [ "$FORCE" -eq 0 ] && is_xbps_owned_path "$path"; then
+		echo "skipping package-owned: $path"
+		return 0
+	fi
+
+	echo "removing: $path"
+	run rm -rf "$path"
+}
+
+version_from_path() {
+	base="${1##*/}"
+
+	case "$base" in
+		vmlinuz-*)       printf '%s\n' "${base#vmlinuz-}" ;;
+		vmlinux-*)       printf '%s\n' "${base#vmlinux-}" ;;
+		initramfs-*.img) printf '%s\n' "$base" | sed 's/^initramfs-//; s/\.img$//' ;;
+		config-*)        printf '%s\n' "${base#config-}" ;;
+		System.map-*)    printf '%s\n' "${base#System.map-}" ;;
+		void-x86_64-*.conf)
+			printf '%s\n' "$base" | sed 's/^void-x86_64-//; s/\.conf$//'
+			;;
+		*) return 1 ;;
+	esac
+}
+
+all_kernel_versions() {
+	for f in \
+		"$BOOT_DIR"/vmlinuz-* \
+		"$BOOT_DIR"/vmlinux-* \
+		"$BOOT_DIR"/initramfs-*.img \
+		"$BOOT_DIR"/config-* \
+		"$BOOT_DIR"/System.map-* \
+		"$ENTRIES_DIR"/void-x86_64-*.conf
+	do
+		[ -e "$f" ] || [ -L "$f" ] || continue
+		version_from_path "$f" || true
+	done
+
+	for d in "$MODULES_DIR"/*; do
+		[ -d "$d" ] || continue
+		printf '%s\n' "${d##*/}"
+	done
+}
+
+list_kernels() {
+	if [ "$#" -eq 0 ]; then
+		set -- all
+	fi
+
+	all_kernel_versions | while IFS= read -r kver; do
+		[ -n "$kver" ] || continue
+
+		if is_running_kernel "$kver"; then
+			continue
+		fi
+
+		for pattern in "$@"; do
+			case "$pattern" in
+				all)
+					printf '%s\n' "$kver"
+					;;
+				*)
+					case "$kver" in
+						$pattern) printf '%s\n' "$kver" ;;
+					esac
+					;;
+			esac
+		done
+	done | sort -uV
+}
+
+remove_kernel() {
+	kver="$1"
+
+	if is_running_kernel "$kver"; then
+		echo "refusing to remove running kernel: $kver" >&2
+		return 1
+	fi
+
+	echo "Removing kernel $kver..."
+
+	remove_path "$BOOT_DIR/config-$kver"
+	remove_path "$BOOT_DIR/System.map-$kver"
+	remove_path "$BOOT_DIR/vmlinuz-$kver"
+	remove_path "$BOOT_DIR/vmlinux-$kver"
+	remove_path "$BOOT_DIR/initramfs-$kver.img"
+	remove_path "$ENTRIES_DIR/void-x86_64-$kver.conf"
+
+	remove_path "$MODULES_DIR/$kver"
+
+	remove_path "$SRC_DIR/kernel-headers-$kver"
+	remove_path "$SRC_DIR/linux-$kver"
+
+	if [ -L "$SRC_DIR/linux" ]; then
+		link_target="$(readlink "$SRC_DIR/linux")"
+
+		case "$link_target" in
+			"$SRC_DIR/linux-$kver"|*/linux-"$kver")
+				echo "removing stale symlink: $SRC_DIR/linux -> $link_target"
+				run rm -f "$SRC_DIR/linux"
+				;;
+		esac
+	fi
+
+	remove_path "/usr/lib/debug/boot/vmlinux-$kver"
+	remove_path "/usr/lib/debug/boot/vmlinuz-$kver"
+	remove_path "/usr/lib/debug/usr/lib/modules/$kver"
+	remove_path "$BOOT_DIR/dtbs/dtbs-$kver"
+}
+
+while getopts "dfh" opt; do
+	case "$opt" in
+		d) DRYRUN=1 ;;
+		f) FORCE=1 ;;
+		h) usage; exit 0 ;;
+		*) usage >&2; exit 2 ;;
+	esac
+done
+
+shift $((OPTIND - 1))
+
+cmd="${1:-}"
+[ -n "$cmd" ] || {
+	usage >&2
+	exit 2
+}
+
+case "$cmd" in
+	list)
+		shift
+		list_kernels "$@"
+		;;
+
+	rm)
+		shift
+
+		[ "$#" -gt 0 ] || {
+			usage >&2
+			exit 2
+		}
+
+		if [ "$(id -u)" -ne 0 ]; then
+			echo "error: must be run as root" >&2
+			exit 1
+		fi
+
+		for kver in $(list_kernels "$@"); do
+			remove_kernel "$kver"
+		done
+		;;
+
+	*)
+		usage >&2
+		exit 2
+		;;
+esac
